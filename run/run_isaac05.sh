@@ -28,9 +28,7 @@ SMOKE_GPUS=${SMOKE_GPUS:-0,1,2,3}
 STEPS=${STEPS:-20000}
 SAVE_FREQ=${SAVE_FREQ:-2500}
 
-# A100-80GB：micro-batch=1，8 卡 + grad_acc=8 -> effective batch=64？
-# 注意 LeRobot 的 gradient_accumulation_steps 与 batch_size 定义以 trainer 为准；
-# 为保持保守显存并统一实验，这里默认 1×4×8=32。
+# A100-80GB 默认保守配置：1×4×8=32 effective batch。
 BATCH=${BATCH:-1}
 GRAD_ACC=${GRAD_ACC:-4}
 SMOKE_GRAD_ACC=${SMOKE_GRAD_ACC:-8}
@@ -47,27 +45,20 @@ COMMON=(
     --base-package "$BASE_PACKAGE"
     --vocab "$VOCAB"
     --allow-unqualified-device
-
-    # 保持当前 3-step observation / RTC 训练语义；真正的 backbone 反向图关闭。
     --max-seq-len 8192
     --n-obs-steps 3
     --detach-vlm-activations
-
     --rtc-max-delay-steps 12
     --rtc-probability 0.5
     --rtc-prefix-length 4
-
     --fsdp
     --save-fp32
     --num-workers "$NUM_WORKERS"
     --video-backend "$VIDEO_BACKEND"
     --train-samples-per-chunk "$SAMPLES_PER_CHUNK"
-
-    # expert-only 下文本 NTP 不更新冻结 backbone，直接改为纯 flow action loss。
     --loss-plan flow_matching_action_prediction
     --action-expert-lr "$EXPERT_LR"
     --max-train-steps "$STEPS"
-
     --wandb
     --wandb-project isaac05-finetune
 )
@@ -77,11 +68,19 @@ if [ "$TORCH_COMPILE" = "1" ]; then
     echo "[提示] torch.compile 已开启；A100/FSDP/remote-code 若出现兼容问题，设置 TORCH_COMPILE=0。"
 fi
 
+gpu_count() { awk -F, '{print NF}' <<< "$1"; }
+TRAIN_GPU_COUNT=$(gpu_count "$TRAIN_GPUS")
+EFFECTIVE_BATCH=$((BATCH * GRAD_ACC * TRAIN_GPU_COUNT))
+
+if [ "$EFFECTIVE_BATCH" -ne 32 ]; then
+    echo "[提示] 当前 effective batch=$EFFECTIVE_BATCH（推荐默认值 32）；如有意调整可通过 BATCH/GRAD_ACC 覆盖。"
+fi
+
 echo "=================================================="
 echo " A100 多卡动作头/连接层训练 preset"
 echo "=================================================="
-echo " TRAIN_GPUS=$TRAIN_GPUS"
-echo " BATCH=$BATCH  GRAD_ACC=$GRAD_ACC  effective=$((BATCH * GRAD_ACC * $(awk -F, '{print NF}' <<< "$TRAIN_GPUS")))"
+echo " TRAIN_GPUS=$TRAIN_GPUS ($TRAIN_GPU_COUNT GPUs)"
+echo " BATCH=$BATCH  GRAD_ACC=$GRAD_ACC  effective=$EFFECTIVE_BATCH"
 echo " FLOW_MC=$SAMPLES_PER_CHUNK  OBS_STEPS=3  MAX_SEQ_LEN=8192"
 echo " BACKBONE=Frozen/BF16 + detach  |  TRAINABLE=ActionExpert/Connector"
 echo " FSDP=ON  activation_checkpointing=OFF"
@@ -96,7 +95,7 @@ case "$MODE" in
         --batch-size 1 --grad-accum "$SMOKE_GRAD_ACC"
     ;;
   full)
-    echo "== [full] 8 卡 ${STEPS} 步 =="
+    echo "== [full] ${TRAIN_GPU_COUNT} 卡 ${STEPS} 步 =="
     python "$SCRIPT" "${COMMON[@]}" \
         --gpus "$TRAIN_GPUS" \
         --steps "$STEPS" --save-freq "$SAVE_FREQ" \
@@ -113,4 +112,4 @@ echo "=============================================="
 echo "检查点: $CKPT"
 echo "部署: CUDA_VISIBLE_DEVICES=0,1 python $RUN_DIR/deploy_isaac.py --policy-path $CKPT --device-map auto --num-inference-steps 6"
 echo "续训: python $SCRIPT --output-dir $OUTPUT_DIR --gpus $TRAIN_GPUS --resume --steps $STEPS --allow-unqualified-device --detach-vlm-activations"
-eecho "=============================================="
+echo "=============================================="
