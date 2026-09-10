@@ -1,0 +1,27 @@
+# VCS metadata — never ship the git trees into the image
+.git
+**/.git
+.gitmodules
+
+# Python / local caches
+**/.venv
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.cache
+
+# Test suite, media and build outputs (not needed in a deploy/train image)
+lerobot/tests
+lerobot/media
+lerobot/outputs
+lerobot/wandb
+lerobot/data
+lerobot/docs/_build
+lerobot/benchmarks
+
+# Build-local helpers that do not belong in the image context
+build.sh
+docker/README.md
+*.md~

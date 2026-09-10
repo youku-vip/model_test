@@ -1,0 +1,81 @@
+# syntax=docker/dockerfile:1
+#
+# Isaac 0.5 — Perceptron Isaac CPU image (no GPU / no CUDA toolkit)
+# =================================================================
+# Environment-only: code / weights / data are mounted at runtime (see Dockerfile
+# header). Includes Rust because the official mharmony[qwen35] dependency builds
+# from git. The Linux lockfile resolves torch to the cu128 build (imports and
+# runs on CPU-only hosts; CUDA calls need a GPU at runtime).
+
+ARG PYTHON_VERSION=3.12
+FROM python:${PYTHON_VERSION}-slim
+
+ARG LEROBOT_EXTRAS="--extra perceptron_isaac --extra training --extra peft"
+ARG HF_ENDPOINT=https://huggingface.co
+ARG APT_MIRROR=mirrors.aliyun.com
+ARG MHARMONY_GIT_URL=https://gh-proxy.com/https://github.com/perceptron-ai-inc/mharmony.git
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PATH="/opt/venv/bin:$PATH" \
+    MUJOCO_GL=egl \
+    HF_ENDPOINT="${HF_ENDPOINT}" \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    VIRTUAL_ENV=/opt/venv \
+    UV_PROJECT_ENVIRONMENT=/opt/venv
+
+# ---- 1. System dependencies + uv + Rust (as root) -------------------------
+RUN sed -i \
+        -e "s|http://deb.debian.org/debian|https://${APT_MIRROR}/debian|g" \
+        -e "s|http://deb.debian.org/debian-security|https://${APT_MIRROR}/debian-security|g" \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git curl ca-certificates \
+        libglib2.0-0 libgl1 libegl1 ffmpeg \
+        libusb-1.0-0-dev libgeos-dev portaudio19-dev \
+        cmake pkg-config ninja-build \
+    && curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.87.0 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# ---- 2. Non-root user -----------------------------------------------------
+RUN useradd --create-home --shell /bin/bash user_lerobot \
+    && usermod -aG sudo user_lerobot
+
+WORKDIR /lerobot
+RUN chown -R user_lerobot:user_lerobot /lerobot /usr/local/cargo /usr/local/rustup \
+    && mkdir -p /opt/venv /opt/isaac && chown -R user_lerobot:user_lerobot /opt
+
+USER user_lerobot
+ENV HOME=/home/user_lerobot \
+    PATH="/usr/local/cargo/bin:$PATH" \
+    HF_HOME=/home/user_lerobot/.cache/huggingface \
+    HF_LEROBOT_HOME=/home/user_lerobot/.cache/huggingface/lerobot \
+    TORCH_HOME=/home/user_lerobot/.cache/torch \
+    TRITON_CACHE_DIR=/home/user_lerobot/.cache/triton
+
+# ---- 3. Dependencies first (cached layer) --------------------------------
+COPY --chown=user_lerobot:user_lerobot \
+     lerobot/pyproject.toml lerobot/uv.lock lerobot/setup.py \
+     lerobot/README.md lerobot/MANIFEST.in /lerobot/
+
+RUN sed -i "s|https://github.com/perceptron-ai-inc/mharmony.git|${MHARMONY_GIT_URL}|g" \
+        pyproject.toml uv.lock \
+    && uv venv /opt/venv --python python${PYTHON_VERSION} \
+    && uv sync --locked ${LEROBOT_EXTRAS} --no-install-project --no-cache
+
+# ---- 4. Project snapshot (so the image works without any mount) -----------
+COPY --chown=user_lerobot:user_lerobot lerobot/ /lerobot/
+RUN sed -i "s|https://github.com/perceptron-ai-inc/mharmony.git|${MHARMONY_GIT_URL}|g" \
+        pyproject.toml uv.lock \
+    && uv sync --locked ${LEROBOT_EXTRAS} --no-cache
+
+# ---- 5. Helper scripts (outside mount-shadowed paths) ---------------------
+COPY --chmod=0755 docker/entrypoint.sh docker/isaac-check /usr/local/bin/
+COPY --chown=user_lerobot:user_lerobot docker/*.py /opt/isaac/docker/
+
+# Mounted code (isaac repo at /code) wins over the baked-in snapshot.
+ENV PYTHONPATH=/code/lerobot/src
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["/bin/bash"]

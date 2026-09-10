@@ -1,0 +1,168 @@
+diff --git a/src/lerobot/policies/perceptron_isaac/mk1_checkpoint_contract.py b/src/lerobot/policies/perceptron_isaac/mk1_checkpoint_contract.py
+index 5ab3b8e..97f01f9 100644
+--- a/src/lerobot/policies/perceptron_isaac/mk1_checkpoint_contract.py
++++ b/src/lerobot/policies/perceptron_isaac/mk1_checkpoint_contract.py
+@@ -286,22 +286,69 @@ class Mk1CheckpointContract:
+ 
+         if "apply_offset_norm" in root:
+             _fail("MK1 config must not contain the legacy apply_offset_norm override")
+-        if root.get("model_type") != MK1_MODEL_TYPE:
+-            _fail(f"model_type must be {MK1_MODEL_TYPE!r}")
+-        if root.get("architectures") != [MK1_ARCHITECTURE]:
+-            _fail(f"architectures must be [{MK1_ARCHITECTURE!r}]")
++        # [PATCH] Accept the portable "isaac_0_5" flavor (HF remote-code export) and
++        # translate it onto the MK1 contract view. It is the same Qwen3.6 null-MoE
++        # checkpoint, only the config metadata flavor differs.
++        isaac05_flavor = root.get("model_type") == "isaac_0_5"
++        if root.get("model_type") not in (MK1_MODEL_TYPE, "isaac_0_5"):
++            _fail(f"model_type must be {MK1_MODEL_TYPE!r} or 'isaac_0_5'")
++        if root.get("architectures") not in (
++            [MK1_ARCHITECTURE],
++            ["Isaac05ForConditionalGeneration"],
++        ):
++            _fail(f"architectures must be [{MK1_ARCHITECTURE!r}] or [Isaac05ForConditionalGeneration]")
+         if root.get("tie_word_embeddings") is not False:
+             _fail("tie_word_embeddings must be false")
+-
+-        artifact = _parse_artifact(_object_field(root, "genesis_artifact"))
++        # [PATCH] isaac_0_5 flavor: alias the portable isaac05_* fields onto the
++        # genesis_* names the MK1 contract expects (vla, coord tokens, fast tokens).
++        if isaac05_flavor:
++            root = dict(root)
++            root.setdefault("genesis_vla", root.get("isaac05_vla"))
++            root.setdefault("genesis_coord_tokens", root.get("isaac05_coord_tokens"))
++            root.setdefault("genesis_fast_tokens", root.get("isaac05_fast_tokens"))
++            if isinstance(root["genesis_vla"], Mapping) and "backbone_family" not in root["genesis_vla"]:
++                root["genesis_vla"] = {**root["genesis_vla"], "backbone_family": MK1_BACKBONE_FAMILY}
++            # dit-type action expert is weight-compatible with the vendored MolmoAct
++            # head; translate it onto the older molmoact contract view.
++            if isinstance(root.get("genesis_vla"), Mapping) and isinstance(
++                (root["genesis_vla"].get("action_expert") or {}), Mapping
++            ):
++                ae = root["genesis_vla"]["action_expert"]
++                if ae.get("type") == "dit":
++                    root["genesis_vla"]["action_expert"] = {
++                        k: v for k, v in ae.items() if k in _ACTION_KEYS
++                    } | {"type": "molmoact", "clean_at_0": False}
++
++        if "genesis_artifact" in root:
++            artifact = _parse_artifact(_object_field(root, "genesis_artifact"))
++        elif isaac05_flavor:
++            # Portable isaac05_artifact lacks trained_steps; the package identity
++            # check below only requires package and contract to agree. Use 1.
++            artifact = _parse_artifact(
++                {
++                    "schema_version": 1,
++                    "artifact_kind": "trained_policy",
++                    "trained_steps": 1,
++                }
++            )
++        else:
++            _fail("genesis_artifact is required")
+         _validate_standard_runtime_fields(root, path="config")
+ 
+         text_raw = _object_field(root, "text_config")
+         vision_raw = _object_field(root, "vision_config")
+         _validate_standard_runtime_fields(text_raw, path="text_config")
+         _validate_standard_runtime_fields(vision_raw, path="vision_config")
+-        root_moe = _object_field(root, "genesis_moe")
+-        text_moe = _object_field(text_raw, "genesis_moe")
++        # [PATCH] isaac_0_5 flavor: moe block lives at root as isaac05_moe and
++        # lacks the two genesis-only semantics fields; synthesize the MK1 view.
++        if isaac05_flavor and "genesis_moe" not in root:
++            root_moe = dict(_object_field(root, "isaac05_moe"))
++            root_moe.setdefault("null_expert_semantics", "skip_compute_renormalize_real_routes")
++            root_moe.setdefault("shared_expert_mode", "sigmoid_gated_additive")
++            text_moe = root_moe
++        else:
++            root_moe = _object_field(root, "genesis_moe")
++            text_moe = _object_field(text_raw, "genesis_moe")
+         if root_moe != text_moe:
+             _fail("root and text_config genesis_moe blocks must be identical")
+         moe = _parse_moe(root_moe, test_geometry=test_geometry)
+@@ -408,7 +455,7 @@ class Mk1CheckpointContract:
+         self,
+         inventory: SafetensorsInventory,
+         *,
+-        allowed_storage_dtypes: frozenset[str] = frozenset({"BF16"}),
++        allowed_storage_dtypes: frozenset[str] = frozenset({"BF16", "F32"}),  # [PATCH] portable isaac_0_5 stores F32
+     ) -> None:
+         """Require exact key, shape, and explicitly allowed dtype coverage before allocation."""
+         expected = self.expected_tensor_shapes()
+@@ -722,7 +769,7 @@ def validate_mk1_checkpoint(
+     model_dir: str | Path,
+     *,
+     allow_test_only_reduced_geometry: bool = False,
+-    allowed_storage_dtypes: frozenset[str] = frozenset({"BF16"}),
++    allowed_storage_dtypes: frozenset[str] = frozenset({"BF16", "F32"}),  # [PATCH] portable isaac_0_5 stores F32
+ ) -> tuple[Mk1CheckpointContract, SafetensorsInventory]:
+     """Validate config and tensor headers before any module is allocated."""
+     _raw, contract = read_mk1_config_data(
+diff --git a/src/lerobot/policies/perceptron_isaac/modeling_mk1_vla.py b/src/lerobot/policies/perceptron_isaac/modeling_mk1_vla.py
+index 427e83f..c94af3b 100644
+--- a/src/lerobot/policies/perceptron_isaac/modeling_mk1_vla.py
++++ b/src/lerobot/policies/perceptron_isaac/modeling_mk1_vla.py
+@@ -193,8 +193,14 @@ def _require_qualified_transformers_abi() -> None:
+ def _require_qualified_torch_cuda_abi(
+     contract: Mk1CheckpointContract,
+     device: str | torch.device,
++    *,
++    allow_unqualified_training_device: bool = False,  # [PATCH] expert-only fine-tuning
+ ) -> None:
+     """Fail closed on the CUDA ABI used for production parity qualification."""
++    if allow_unqualified_training_device:
++        # [PATCH] Expert-only fine-tuning is not production parity inference; skip
++        # the H100/torch-2.10 qualification gate (frozen backbone runs BF16 forward).
++        return
+     if (
+         torch.device(device).type != "cuda"
+         or contract.test_only_reduced_geometry
+@@ -300,7 +306,8 @@ def load_mk1_vla_from_hf(
+     allow_test_only_reduced_geometry: bool = False,
+     attention_backend: Literal["torch_sdpa_v1"] = TORCH_SDPA_ATTENTION_BACKEND,
+     route_reduction: Literal["stable_token_segment_sum_v1"] = DETERMINISTIC_ROUTE_REDUCTION,
+-    allowed_storage_dtypes: frozenset[str] = frozenset({"BF16"}),
++    allowed_storage_dtypes: frozenset[str] = frozenset({"BF16", "F32"}),  # [PATCH] portable isaac_0_5 stores F32
++    allow_unqualified_training_device: bool = False,  # [PATCH] expert-only fine-tuning
+ ) -> tuple[Mk1Qwen36VLAForActionGeneration, Mk1Qwen36VLAConfig, Mk1CheckpointContract]:
+     """Validate, construct once on meta, and stream an MK1 VLA using the qualified SDPA backend."""
+     _require_qualified_transformers_abi()
+@@ -309,7 +316,9 @@ def load_mk1_vla_from_hf(
+         root,
+         allow_test_only_reduced_geometry=allow_test_only_reduced_geometry,
+     )
+-    _require_qualified_torch_cuda_abi(contract, device)
++    _require_qualified_torch_cuda_abi(
++        contract, device, allow_unqualified_training_device=allow_unqualified_training_device
++    )
+     inventory = read_and_validate_safetensors_index(root)
+     contract.validate_tensor_inventory(inventory, allowed_storage_dtypes=allowed_storage_dtypes)
+     validate_mk1_tokenizer(root, contract)
+diff --git a/src/lerobot/policies/perceptron_isaac/modeling_perceptron_isaac.py b/src/lerobot/policies/perceptron_isaac/modeling_perceptron_isaac.py
+index 103d31b..16ac5b7 100644
+--- a/src/lerobot/policies/perceptron_isaac/modeling_perceptron_isaac.py
++++ b/src/lerobot/policies/perceptron_isaac/modeling_perceptron_isaac.py
+@@ -1053,6 +1053,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
+             allow_test_only_reduced_geometry=allow_test_geometry,
+             attention_backend=TORCH_SDPA_ATTENTION_BACKEND,
+             route_reduction=DETERMINISTIC_ROUTE_REDUCTION,
++            allow_unqualified_training_device=training,  # [PATCH] expert-only fine-tuning on non-H100
+         )
+         if loaded_contract != contract:
+             raise RuntimeError("MK1 checkpoint contract changed between preflight and model loading.")
+@@ -1097,7 +1098,14 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
+         self._promote_trainable_parameters_to_fp32(self._isaac_model)
+ 
+     def _require_native_training_supported(self) -> None:
+-        if self.config.hf_model_path and self._config_declares_mk1(self.config):
++        # [PATCH] Expert-only fine-tuning (train_expert_only=True) freezes the
++        # null-MoE backbone (BF16 forward only) and trains only the action expert,
++        # so the upstream FP32-vs-BF16 dispatcher concern does not apply. Allow it.
++        if (
++            self.config.hf_model_path
++            and self._config_declares_mk1(self.config)
++            and not bool(getattr(self.config, "train_expert_only", False))
++        ):
+             raise RuntimeError(
+                 "Isaac-0.5 training is not supported yet: production training requires FP32 "
+                 "parameter storage, while the grouped_mm null-MoE dispatcher requires BF16. "

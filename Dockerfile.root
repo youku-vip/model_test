@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+#
+# Isaac 0.5 — ROOT 运行变体（薄层，基于已构建的 isaac:gpu）
+# ==============================================================================
+# 用途: 以 root 身份运行容器，避免对挂载目录（模型仓库/数据集/代码）的权限问题。
+#       复用 isaac:gpu 的全部环境层，构建只需几秒。
+#
+# 构建:
+#   docker build -f Dockerfile.root -t isaac:gpu-root .
+#
+# 运行（训练代码/数据集/模型 全部挂载，不打包进镜像）:
+#   docker run -it --rm --gpus all --shm-size 16gb \
+#     -v <host_isaac_repo>:/code \
+#     -v <host_checkpoints>:/checkpoint \
+#     -v <host_data>:/data \
+#     -v <host_vocab_json>:/vocab/vocab.json \
+#     -e QWEN35_VOCAB_PATH=/vocab/vocab.json \
+#     isaac:gpu-root
+#
+# 挂载约定:
+#   /code       训练源码（isaac + lerobot，PYTHONPATH=/code/lerobot/src）
+#   /data       数据集(/data/datasets) + 模型仓库(/data/modelRepository)
+#   /checkpoint 训练检查点输出
+#   /vocab      Qwen vocab (vocab.json)
+# ==============================================================================
+ARG BASE_IMAGE=isaac:gpu
+FROM ${BASE_IMAGE}
+
+# 运行用户切换为 root（基础镜像默认 user_lerobot）
+USER root
+
+# 缓存/环境目录归 root，避免污染 user_lerobot 家目录
+ENV HOME=/root \
+    HF_HOME=/root/.cache/huggingface \
+    HF_LEROBOT_HOME=/root/.cache/huggingface/lerobot \
+    TORCH_HOME=/root/.cache/torch \
+    TRITON_CACHE_DIR=/root/.cache/triton
+
+# 预建挂载点（运行时 -v 挂载会覆盖这些目录）
+RUN mkdir -p /code /checkpoint /data /vocab /opt/isaac/docker
+
+CMD ["/bin/bash"]

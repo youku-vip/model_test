@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Isaac environment smoke check: python/torch/CUDA, policy import, mharmony
+# runtime status, and available CLI entrypoints.
+set -e
+PY=${PY:-python}
+
+echo "== Isaac environment check =="
+"$PY" - <<'EOF'
+import sys
+import torch
+
+print(f"python       : {sys.version.split()[0]}")
+print(f"torch        : {torch.__version__} (cuda build {torch.version.cuda})")
+print(f"cuda avail   : {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"gpu          : {torch.cuda.get_device_name(0)} (cc {torch.cuda.get_device_capability(0)})")
+
+try:
+    from lerobot.policies.perceptron_isaac import PerceptronIsaacPolicy  # noqa: F401
+    print("policy       : PerceptronIsaacPolicy import OK")
+except Exception as exc:  # noqa: BLE001
+    print(f"policy       : import FAILED -> {exc}")
+
+try:
+    from lerobot.policies.perceptron_isaac.mharmony_adapter import assert_mharmony_available
+
+    assert_mharmony_available()
+    print("mharmony     : available (standalone mharmony package)")
+except Exception as exc:  # noqa: BLE001
+    print(
+        "mharmony     : NOT available -> the standalone mharmony package is missing; "
+        "check the build (Rust toolchain + git source) or the mounted code."
+    )
+EOF
+echo
+echo "== CLI entrypoints =="
+for cli in lerobot-train lerobot-eval lerobot-isaac-import lerobot-isaac-export-bf16 \
+           lerobot-isaac-convert-mds lerobot-isaac-parity lerobot-info lerobot-rollout; do
+    if command -v "$cli" >/dev/null 2>&1; then
+        printf '  %-26s OK\n' "$cli"
+    else
+        printf '  %-26s missing\n' "$cli"
+    fi
+done
